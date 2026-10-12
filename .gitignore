@@ -1,0 +1,30 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and caches
+*.log
+.cache/
+.pytest_cache/
+
+# Local databases, indexes, and generated data
+chroma_db/
+vector_db/
+faiss_index/
