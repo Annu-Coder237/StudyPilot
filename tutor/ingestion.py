@@ -8,30 +8,27 @@ import time
 
 
 
-def should_recover_page(text: str, has_images: bool = False) -> bool:
-    """Use vision only when native PDF text extraction is clearly inadequate."""
+def should_recover_page(text: str, has_images: bool = False, has_drawings: bool = False) -> bool:
+    """Select pages for vision only when native text is weak and visual content may matter."""
     text = (text or "").strip()
+    has_visuals = has_images or has_drawings
 
-    # Empty or nearly empty pages are strong recovery candidates.
+    # Empty pages without visual content are likely blank; don't waste a model call.
     if len(text) < 30:
-        return True
+        return has_visuals
 
-    # Replacement characters indicate potentially corrupted text extraction.
     if "\ufffd" in text:
         return True
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    words = re.findall(r"[A-Za-z0-9]{2,}", text)
-
-    # Flag pages where text is fragmented into many isolated glyphs.
-    if (
-        len(lines) >= 12
-        and len([line for line in lines if len(line) <= 5]) / len(lines) >= 0.70
-    ):
+    if len(lines) >= 12 and sum(len(line) <= 5 for line in lines) / len(lines) >= 0.70:
         return True
 
-    # Do not invoke vision merely because a page contains an image.
-    # Sparse text on an image-heavy page is not, by itself, proof of failure.
+    # Sparse native text plus an image/diagram is a good auto-recovery candidate.
+    if len(text) < 260 and has_visuals:
+        return True
+
+    # Avoid expensive vision calls on ordinary text pages.
     return False
 
 
@@ -185,6 +182,12 @@ def extract_pdf_pages(
             print(extracted_text[:1500])
 
             has_images = bool(pdf_page.get_images(full=True))
+            try:
+                has_drawings = bool(pdf_page.get_drawings())
+                drawing_count = len(pdf_page.get_drawings())
+            except Exception:
+                has_drawings = False
+                drawing_count = 0
 
             should_try = (
                 vision_mode == "all"
@@ -193,6 +196,7 @@ def extract_pdf_pages(
                     and should_recover_page(
                         extracted_text,
                         has_images=has_images,
+                        has_drawings=has_drawings,
                     )
                 )
             )
@@ -212,6 +216,9 @@ def extract_pdf_pages(
                 "extraction_metadata": {
                     "text_block_count": len(text_blocks),
                     "has_images": has_images,
+                    "has_drawings": has_drawings,
+                    "image_count": len(pdf_page.get_images(full=True)),
+                    "drawing_count": drawing_count,
                     "text_order": "top-to-bottom PDF blocks",
                 },
                 "vision_text": "",
@@ -337,7 +344,12 @@ def chunk_pages(pages, chunk_size=1200, overlap=200):
         vision_text = (page.get("vision_text") or "").strip()
 
         
-        text = vision_text if vision_text else base_text
+        # Preserve native text when it is already useful. Vision is preferred only
+        # when native extraction is empty/very sparse or clearly corrupted.
+        native_bad = (len(base_text) < 80 or "\ufffd" in base_text)
+        text = vision_text if vision_text and native_bad else base_text
+        if not text:
+            text = vision_text
 
         if not text:
             continue

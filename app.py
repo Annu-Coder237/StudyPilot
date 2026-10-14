@@ -2,8 +2,106 @@ import json
 import re
 from pathlib import Path
 
+import threading
+import uuid
+
 import fitz
 import streamlit as st
+
+
+# ---------- Background tasks ----------
+# Keep task results outside Streamlit session state while a worker is running.
+TASKS = {}
+TASKS_LOCK = threading.Lock()
+
+
+def run_background_task(task_id, function, *args, **kwargs):
+    """Run a slow operation without blocking the Streamlit script thread."""
+    with TASKS_LOCK:
+        TASKS[task_id] = {
+            "status": "running",
+            "result": None,
+            "error": None,
+        }
+
+    try:
+        result = function(*args, **kwargs)
+        with TASKS_LOCK:
+            TASKS[task_id] = {
+                "status": "done",
+                "result": result,
+                "error": None,
+            }
+    except Exception as exc:
+        with TASKS_LOCK:
+            TASKS[task_id] = {
+                "status": "error",
+                "result": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+
+def start_background_task(function, *args, **kwargs):
+    task_id = uuid.uuid4().hex
+    thread = threading.Thread(
+        target=run_background_task,
+        args=(task_id, function, *args),
+        kwargs=kwargs,
+        daemon=True,
+    )
+    thread.start()
+    return task_id
+
+
+def get_task(task_id):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        return dict(task) if task else None
+
+
+def infer_course_name(pages, filename=""):
+    """Infer the course from extracted document text; use filename only as fallback."""
+    ignored = {
+        "lecture notes", "lecture note", "contents", "table of contents",
+        "introduction", "references", "bibliography", "abstract",
+        "chapter 1", "chapter 2", "course material", "assignment",
+    }
+    candidates = []
+    for page in pages[:4]:
+        text = str(page.get("text", "") or page.get("raw_text", "") or "")
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip(" •·-–—|:#\t")
+            if not line or len(line) > 100:
+                continue
+            low = line.casefold()
+            words = line.split()
+            letters = sum(ch.isalpha() for ch in line)
+            if low in ignored or len(words) < 2 or len(words) > 12:
+                continue
+            if letters / max(len(line), 1) < 0.65:
+                continue
+            if line.endswith((".", ",", ";", ":", "?")):
+                continue
+            if re.match(r"^(page\s+\d+|chapter\s+\d+|unit\s+\d+|copyright|www\.)", low):
+                continue
+            # Prefer concise title-like lines over ordinary explanatory sentences.
+            score = 0
+            score += 3 if len(words) <= 7 else 0
+            score += 2 if line.istitle() or line.isupper() else 0
+            score += 2 if any(term in low for term in ("signals", "systems", "electronics", "mathematics", "physics", "computer", "programming", "data science", "digital", "probability", "linear algebra", "lecture")) else 0
+            score -= 2 if len(words) >= 10 else 0
+            candidates.append((score, line))
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], len(item[1])))
+        return candidates[0][1]
+
+    stem = Path(filename).stem if filename else ""
+    stem = re.sub(r"[_-]+", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    if stem and stem.casefold() not in {"document", "lecture", "notes", "scan", "general course"}:
+        return stem
+    return "My Course"
+
 
 from tutor.ingestion import extract_pdf_pages, chunk_pages
 from tutor.retrieval import retrieve_relevant_chunks
@@ -26,6 +124,63 @@ except Exception:
 
 st.set_page_config(page_title="StudyPilot AI", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
 
+
+def process_pdf_job(pdf_bytes, filename, vision_mode, ollama_url, vision_model):
+    """Worker function: process a PDF without calling Streamlit APIs."""
+    pages = extract_pdf_pages(
+        pdf_bytes, source_name=filename, vision_mode=vision_mode,
+        ollama_url=ollama_url, vision_model=vision_model,
+    )
+    chunks = chunk_pages(pages)
+    course_map = build_course_map(chunks)
+    return {
+        "pages": pages, "chunks": chunks, "course_map": course_map,
+        "pdf_bytes": pdf_bytes, "filename": filename,
+        "course_name": infer_course_name(pages, filename),
+    }
+
+
+def process_video_job(video_bytes, filename, vision_model, ollama_url, interval):
+    records = ingest_video(
+        video_bytes, filename, vision_model, ollama_url,
+        interval=interval, max_frames=12,
+    )
+    return records
+
+
+@st.fragment(run_every="1s")
+def poll_background_task(task_key, result_key, label):
+    """Show local progress and publish completed results without a global spinner."""
+    task_id = st.session_state.get(task_key)
+    if not task_id:
+        return
+    task = get_task(task_id)
+    if task is None or task["status"] == "running":
+        # Keep an animated loading indicator visible while the worker runs.
+        # This is rendered inside the current section, so it does not block or
+        # dim the rest of the Streamlit app like a long synchronous spinner.
+        st.markdown(
+            f"""
+            <div class="task-loading" role="status" aria-live="polite">
+                <span class="task-spinner" aria-hidden="true"></span>
+                <div class="task-loading-copy">
+                    <strong>{label} in progress</strong>
+                    <span>StudyPilot is working in the background. Other sections remain available.</span>
+                </div>
+                <span class="task-loading-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    if task["status"] == "error":
+        st.error(f"{label} failed: {task['error']}")
+        st.session_state.pop(task_key, None)
+        return
+    st.session_state[result_key] = task["result"]
+    st.session_state.pop(task_key, None)
+    st.rerun()
+
 # ---------- Theme ----------
 st.markdown("""
 <style>
@@ -41,6 +196,43 @@ st.markdown("""
 .weak { border-left:4px solid #e45757; padding:.6rem .8rem; background:#fff7f7; border-radius:8px; margin:.4rem 0; }
 .good { border-left:4px solid #3ca66b; padding:.6rem .8rem; background:#f5fff9; border-radius:8px; margin:.4rem 0; }
 .small { color:#6b7280; font-size:.85rem; }
+
+/* Animated, localized background-task loading indicator */
+.task-loading {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    margin: 0.65rem 0 0.9rem;
+    padding: 0.95rem 1.1rem;
+    border: 1px solid rgba(109, 93, 252, 0.28);
+    border-radius: 14px;
+    background: linear-gradient(110deg, rgba(109,93,252,0.09), rgba(100,180,255,0.07));
+}
+.task-spinner {
+    width: 25px;
+    height: 25px;
+    flex: 0 0 25px;
+    border: 3px solid rgba(109,93,252,0.20);
+    border-top-color: #6d5dfc;
+    border-right-color: #6d5dfc;
+    border-radius: 50%;
+    animation: studypilot-spin 0.8s linear infinite;
+}
+.task-loading-copy { display: flex; flex-direction: column; gap: 0.15rem; }
+.task-loading-copy strong { font-size: 0.98rem; }
+.task-loading-copy span { font-size: 0.84rem; opacity: 0.78; }
+.task-loading-dots { display: flex; gap: 4px; margin-left: auto; }
+.task-loading-dots i {
+    width: 5px; height: 5px; border-radius: 50%; background: #6d5dfc;
+    animation: studypilot-pulse 1s ease-in-out infinite;
+}
+.task-loading-dots i:nth-child(2) { animation-delay: 0.15s; }
+.task-loading-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes studypilot-spin { to { transform: rotate(360deg); } }
+@keyframes studypilot-pulse { 0%, 60%, 100% { opacity: 0.28; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+@media (prefers-reduced-motion: reduce) {
+    .task-spinner, .task-loading-dots i { animation: none; }
+}
 
 /* Course map: compact, consistent typography */
 .map-topic {
@@ -134,7 +326,22 @@ with st.sidebar:
     st.caption("Personalized, source-grounded learning")
     st.divider()
 
-    subject = st.selectbox("Course", ["Signals & Systems", "Digital System Design", "Device Electronics", "Other"], key="course")
+    # Generalized course label: use the uploaded file name when available,
+    # while allowing the user to name the course themselves.
+    # Apply a newly detected name before creating the text_input widget.
+    pending_course_label = st.session_state.pop("pending_course_label", None)
+    if pending_course_label:
+        st.session_state["course_label"] = pending_course_label
+    stored_filename = st.session_state.get("study_filename", "")
+    stored_pages = st.session_state.get("study_pages", [])
+    inferred_course = infer_course_name(stored_pages, stored_filename) if stored_pages else "My Course"
+    if "course_label" not in st.session_state:
+        st.session_state["course_label"] = inferred_course
+    subject = st.text_input(
+        "Course name",
+        key="course_label",
+        help="Name your course; this is not limited to a predefined subject list.",
+    ).strip() or "General Course"
     ollama_url = st.text_input("Ollama URL", "http://localhost:11434")
     text_model = st.text_input("Text model", "qwen3.5:4b")
     vision_model = st.text_input("Vision model", "qwen2.5vl:3b")
@@ -193,72 +400,59 @@ with tab_home:
         vision_mode = st.selectbox(
             "PDF visual recovery",
             ["none", "auto", "all"],
-            index=0,
-            help="None: use native PDF text only. Auto: recover pages with poor extraction. All: run vision on every page."
+            index=1,
+            key="pdf_visual_recovery_mode",
+            help="None: native PDF text only. Auto: selectively recover weak-text/visual pages. All: run vision on every page."
         )
         
         if pdf and st.button(
-            "Process course PDF",
-            type="primary",
-            use_container_width=True,
+            "Process course PDF", type="primary", use_container_width=True,
+            disabled=bool(st.session_state.get("pdf_task_id")),
         ):
-            try:
-                with st.spinner("Building your source-grounded knowledge base..."):
-                    pdf_bytes_new = pdf.getvalue()
-
-                    pages_new = extract_pdf_pages(
-                        pdf_bytes_new,
-                        source_name=pdf.name,
-                        vision_mode=vision_mode,
-                        ollama_url=ollama_url,
-                        vision_model=vision_model,
-                    )
-                    chunks_new = chunk_pages(pages_new)
-                    course_map_new = build_course_map(chunks_new)
-
-                if not chunks_new:
-                    st.error(
-                        "PDF processing finished, but no usable text chunks "
-                        "were extracted. Check the PDF extraction logs."
-                    )
-                else:
-                    reset_document_state()
-
-                    st.session_state.update({
-                        "study_pages": pages_new,
-                        "study_chunks": chunks_new,
-                        "study_filename": pdf.name,
-                        "pdf_bytes": pdf_bytes_new,
-                        "course_map": course_map_new,
-                        "document_ready_notice": (
-                            f"Knowledge base ready: {len(pages_new)} pages, "
-                            f"{len(chunks_new)} chunks."
-                        ),
-                    })
-
-                    # Rerun the app so every tab reads the newly stored data.
-                    st.rerun()
-
-            except Exception as exc:
-                st.error(f"PDF ingestion failed: {type(exc).__name__}: {exc}")
+            # Capture bytes now; the UploadedFile object is not passed to the worker.
+            st.session_state["pdf_task_id"] = start_background_task(
+                process_pdf_job, pdf.getvalue(), pdf.name, vision_mode,
+                ollama_url, vision_model,
+            )
+        poll_background_task("pdf_task_id", "pdf_task_result", "PDF processing")
+        if "pdf_task_result" in st.session_state:
+            result = st.session_state.pop("pdf_task_result")
+            if not result["chunks"]:
+                st.error("PDF processing finished, but no usable text chunks were extracted. Check the PDF extraction logs.")
+            else:
+                reset_document_state()
+                st.session_state.update({
+                    "study_pages": result["pages"],
+                    "study_chunks": result["chunks"],
+                    "study_filename": result["filename"],
+                    "pdf_bytes": result["pdf_bytes"],
+                    "course_map": result["course_map"],
+                    "pending_course_label": result["course_name"],
+                    "document_ready_notice": (
+                        f"Knowledge base ready: {len(result['pages'])} pages, "
+                        f"{len(result['chunks'])} chunks. Detected course: {result['course_name']}"
+                    ),
+                })
+                st.rerun()
 
 
     with col2:
         video = st.file_uploader("🎥 Lecture video", type=["mp4", "mov", "mkv", "webm"], key="video_upload")
         interval = st.slider("Frame sampling interval (seconds)", 10, 90, 30)
-        if video and st.button("Ingest video frames", use_container_width=True):
+        if video and st.button("Ingest video frames", use_container_width=True, disabled=bool(st.session_state.get("video_task_id"))):
             if not VIDEO_AVAILABLE:
                 st.error("Video ingestion module is unavailable.")
             else:
-                try:
-                    with st.spinner("Sampling lecture frames and extracting timestamped content..."):
-                        records = ingest_video(video.getvalue(), video.name, vision_model, ollama_url, interval=interval, max_frames=12)
-                    video_chunks = [dict(r, char_count=len(r.get("text", ""))) for r in records if r.get("text")]
-                    st.session_state["video_records"] = records
-                    st.session_state["study_chunks"] = chunks + video_chunks
-                    st.success(f"Added {len(video_chunks)} timestamped video source units.")
-                except Exception as exc:
-                    st.error(f"Video ingestion failed: {type(exc).__name__}: {exc}. Install FFmpeg and ensure the vision model is available.")
+                st.session_state["video_task_id"] = start_background_task(
+                    process_video_job, video.getvalue(), video.name, vision_model, ollama_url, interval
+                )
+        poll_background_task("video_task_id", "video_task_result", "Video ingestion")
+        if "video_task_result" in st.session_state:
+            records = st.session_state.pop("video_task_result")
+            video_chunks = [dict(r, char_count=len(r.get("text", ""))) for r in records if r.get("text")]
+            st.session_state["video_records"] = records
+            st.session_state["study_chunks"] = st.session_state.get("study_chunks", []) + video_chunks
+            st.success(f"Added {len(video_chunks)} timestamped video source units.")
 
     
     if pages:
@@ -364,13 +558,15 @@ with tab_tutor:
                 with st.expander(f"{i}. {source_badge(chunk)} · relevance {chunk.get('retrieval_score',0):.2f}"):
                     render_rich_text(chunk.get("text", ""))
 
-            if st.button("Explain with StudyPilot", type="primary"):
-                try:
-                    with st.spinner("Generating a source-grounded explanation..."):
-                        answer = generate_tutor_answer(question=st.session_state.get("retrieval_question", question), retrieved_chunks=results, model=text_model, ollama_url=ollama_url)
-                    st.session_state["tutor_answer"] = answer
-                except Exception as exc:
-                    st.error(f"Tutor failed: {type(exc).__name__}: {exc}")
+            if st.button("Explain with StudyPilot", type="primary", disabled=bool(st.session_state.get("tutor_task_id"))):
+                st.session_state["tutor_task_id"] = start_background_task(
+                    generate_tutor_answer,
+                    question=st.session_state.get("retrieval_question", question),
+                    retrieved_chunks=results, model=text_model, ollama_url=ollama_url,
+                )
+            poll_background_task("tutor_task_id", "tutor_task_result", "Tutor response generation")
+            if "tutor_task_result" in st.session_state:
+                st.session_state["tutor_answer"] = st.session_state.pop("tutor_task_result")
 
         if st.session_state.get("tutor_answer"):
             st.markdown("### Tutor")
@@ -395,26 +591,46 @@ with tab_assess:
             st.info("🩺 New learner detected. Start with a diagnostic quiz to establish your initial mastery profile.")
 
         a1, a2, a3 = st.columns(3)
-        topic = a1.text_input("Scope / topic", value=recommended[0] if recommended else subject, key="assessment_topic")
+        default_topic = (
+            recommended[0]
+            if recommended and recommended[0].strip()
+            else subject
+        )
+
+        if "assessment_topic" not in st.session_state:
+            st.session_state["assessment_topic"] = default_topic
+
+        topic = a1.text_input(
+            "Scope / topic",
+            key="assessment_topic",
+            help="Defaults to a detected topic; you can edit it.",
+        )
         count = a2.slider("Questions", 3, 8, 5, key="assessment_count")
         diff = a3.selectbox("Difficulty", ["Mixed", "Easy", "Medium", "Hard"], key="assessment_difficulty")
 
-        if st.button("Generate adaptive assessment", type="primary", use_container_width=True):
+        if st.button("Generate adaptive assessment", type="primary", use_container_width=True, disabled=bool(st.session_state.get("assessment_task_id"))):
             for key in ("active_assessment", "assessment_results"):
                 st.session_state.pop(key, None)
-            try:
-                assessment_chunks = retrieve_relevant_chunks(topic, chunks, top_k=5)
-                if not assessment_chunks:
-                    st.error("No relevant source material was found for that scope.")
-                else:
-                    with st.spinner("Generating and verifying questions from your course material..."):
-                        questions = generate_assessment(topic, assessment_chunks, count, diff, st.session_state.get("question_history", []), text_model, ollama_url)
-                    st.session_state["active_assessment"] = questions
-                    st.session_state["assessment_chunks"] = assessment_chunks
-                    st.session_state["question_history"] = st.session_state.get("question_history", []) + [q["question"] for q in questions]
-                    st.success(f"Ready: {len(questions)} source-tagged questions.")
-            except Exception as exc:
-                st.error(f"Assessment generation failed: {type(exc).__name__}: {exc}")
+            assessment_chunks = retrieve_relevant_chunks(topic, chunks, top_k=5)
+            if not assessment_chunks:
+                st.error("No relevant source material was found for that scope.")
+            else:
+                st.session_state["assessment_chunks_pending"] = assessment_chunks
+                st.session_state["assessment_task_id"] = start_background_task(
+                    generate_assessment, topic, assessment_chunks, count, diff,
+                    st.session_state.get("question_history", []), text_model, ollama_url,
+                )
+        poll_background_task("assessment_task_id", "assessment_task_result", "Assessment generation")
+        if "assessment_task_result" in st.session_state:
+            questions_new = st.session_state.pop("assessment_task_result")
+            assessment_chunks = st.session_state.pop("assessment_chunks_pending", [])
+            if not isinstance(questions_new, list) or not questions_new:
+                st.error("The model returned no usable questions. Please retry or choose a broader topic.")
+            else:
+                st.session_state["active_assessment"] = questions_new
+                st.session_state["assessment_chunks"] = assessment_chunks
+                st.session_state["question_history"] = st.session_state.get("question_history", []) + [q["question"] for q in questions_new]
+                st.success(f"Ready: {len(questions_new)} source-tagged questions.")
 
         questions = st.session_state.get("active_assessment", [])
         if questions:
@@ -448,15 +664,20 @@ with tab_assess:
                 if any(not str(v).strip() for v in answers.values()):
                     st.warning("Please answer every question before submitting.")
                 else:
-                    try:
-                        with st.spinner("Grading and analysing misconceptions..."):
-                            results = evaluate_assessment_answers(questions, answers, text_model, ollama_url)
-                        st.session_state["assessment_results"] = results
-                        for item in results:
-                            record_attempt(st.session_state, item["topic"], item["correct"])
-                        st.success("Assessment complete. Your mastery model has been updated.")
-                    except Exception as exc:
-                        st.error(f"Grading failed: {type(exc).__name__}: {exc}")
+                    if not st.session_state.get("grading_task_id"):
+                        st.session_state["grading_task_id"] = start_background_task(
+                            evaluate_assessment_answers, questions, answers, text_model, ollama_url
+                        )
+                        st.session_state["grading_answers_pending"] = answers
+
+        poll_background_task("grading_task_id", "grading_task_result", "Assessment grading")
+        if "grading_task_result" in st.session_state:
+            graded = st.session_state.pop("grading_task_result")
+            st.session_state["assessment_results"] = graded
+            for item in graded:
+                record_attempt(st.session_state, item["topic"], item["correct"])
+            st.session_state.pop("grading_answers_pending", None)
+            st.success("Assessment complete. Your mastery model has been updated.")
 
         results = st.session_state.get("assessment_results")
         if results:

@@ -5,22 +5,90 @@ import re
 from tutor.generation import _chat
 
 
-def _extract_json(text):
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+def _repair_json_backslashes(raw: str) -> str:
+    """Escape raw LaTeX backslashes inside JSON strings without changing valid JSON escapes."""
+    out = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = raw[i + 1] if i + 1 < len(raw) else ""
+            # A LaTeX command is a backslash followed by a word, e.g. \theta,
+            # \text, \frac. JSON's \t or \n escapes are only valid when
+            # not followed by the rest of an alphabetic command.
+            if nxt.isalpha():
+                j = i + 1
+                while j < len(raw) and raw[j].isalpha():
+                    j += 1
+                command = raw[i + 1:j]
+                if len(command) > 1 or command not in "bfnrt":
+                    out.append("\\\\")
+                    i += 1
+                    continue
+                # Valid one-character JSON escape such as \n or \t.
+                out.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if nxt in '"\\/bfnrt':
+                out.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if nxt == "u" and i + 5 < len(raw) and re.fullmatch(r"[0-9a-fA-F]{4}", raw[i+2:i+6]):
+                out.append(ch)
+                escaped = True
+                i += 1
+                continue
+            # Invalid escape: make it a literal backslash.
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
+
+def _extract_json(text):
+    """Extract JSON from model output and repair common unescaped LaTeX commands."""
+    text = str(text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end < start:
         raise ValueError("The model did not return a JSON object.")
-
     raw = text[start:end + 1]
-
+    # Repair first: json.loads alone can silently interpret LaTeX commands
+    # such as \theta and \frac as JSON tab/form-feed escapes, corrupting math.
+    repaired = _repair_json_backslashes(raw)
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        raw = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
-        return json.loads(raw)
+        return json.loads(repaired)
+    except json.JSONDecodeError as repaired_error:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as original_error:
+            raise ValueError(
+                f"Model output was not valid JSON (after LaTeX repair: {repaired_error}; "
+                f"original: {original_error})."
+            ) from repaired_error
 
 
 def _context(chunks):
@@ -523,6 +591,14 @@ CANDIDATE QUESTIONS:
                 q["verification_note"] = str(
                     check.get("reason", "Passed verification.")
                 )
+                accepted.append(q)
+                seen.add(_normalise(q["question"]))
+            elif check.get("valid") is not False:
+                # If the verifier omitted this ID, retain the structurally valid
+                # question with an explicit unverified flag rather than silently
+                # losing it and ending with an empty assessment.
+                q["verified"] = False
+                q["verification_note"] = "Verifier did not return a decision for this question."
                 accepted.append(q)
                 seen.add(_normalise(q["question"]))
 

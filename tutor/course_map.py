@@ -35,6 +35,9 @@ def _clean_line(value):
         if single_letter_ratio >= 0.5:
             return ""
 
+    # Reject common incomplete sentence fragments that make poor topic labels.
+    if re.match(r"^(and|or|but|because|which|that|by|for|with|from|so|then|also)\b", value, re.I):
+        return ""
     return value
 
 def clean_course_map_text(text):
@@ -67,6 +70,10 @@ def clean_course_map_text(text):
         text,
     )
 
+    # Convert common OCR ligature-like errors and remove math delimiters for labels.
+    text = text.replace("‹", "f").replace("›", "f")
+    text = re.sub(r"\\\\[\[\]()]", " ", text)
+    text = re.sub(r"\\(?:frac|sum|int|cdot|times|alpha|beta|theta|omega)\b", " ", text)
     # Normalize whitespace.
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
@@ -118,9 +125,10 @@ def build_course_map(chunks):
                 (
                     line for line in lines[:8]
                     if len(line) >= 18
-                    and len(re.findall(r"[A-Za-z]{2,}", line)) >= 3
+                    and 3 <= len(re.findall(r"[A-Za-z]{2,}", line)) <= 12
+                    and not re.search(r"[.!?]\s*$", line)
                     and not line.lower().startswith(
-                        ("example:", "problem:", "solution:")
+                        ("example:", "problem:", "solution:", "and ", "which ", "because ", "by ", "so ")
                     )
                 ),
                 None,
